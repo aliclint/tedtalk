@@ -1,4 +1,4 @@
-# tedtalk
+# TEDTalk
 
 Data analysis and poster on what makes a TEDTalk popular.
 
