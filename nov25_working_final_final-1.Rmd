@@ -1,0 +1,703 @@
+---
+title: "Popularity measures on TED Talks"
+author:
+  - Clinton Ali, 998218281, Sajeed Bakht, 1001527975, Kim Estelo, 1001640325, Quinton Goos, 1002542796, Mohamed Osman, 1000851562
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  pdf_document:
+    default
+---
+
+```{r load-package, include=FALSE,warning = FALSE,message=FALSE}
+library(tidyverse)
+library(dplyr)
+library(stringr)
+library(SentimentAnalysis)
+library(jsonlite)
+library(tm)
+library(anytime)
+library(ggfortify)
+library(topicmodels)
+library(tidytext)
+library(naivebayes)
+library(MLmetrics)
+library(cowplot)
+```
+
+```{r,include=FALSE}
+ted_original <- read_csv("ted_main.csv")
+
+ted <- ted_original
+ted$id <- c(1:dim(ted)[1])
+
+ted_transcript_original <- read_csv("transcripts.csv")
+ted_transcript <- ted_transcript_original
+```
+
+```{r, include=FALSE}
+# 86 entries removed + duplicate 
+index <- unique(match(ted_transcript$url, ted$url))
+ted <- ted[(index),]
+ted$transcript <- unique(ted_transcript$transcript)
+```
+
+#i. Responsibilities
+
+Sajeed and Quinton explored the viability of neural network models and exploratory data analysis. Clinton, Kim and Mohamed explored clustering and topic modelling. Everyone worked on preprocessing the data. Clinton and Kim explored and fitted the logistic regression model.
+
+#0 Introduction
+
+Popularity is defined as the state or condition of being liked, admired, or supported by many people. This report aims to define popularity in relation to TED Talks, and use it to find the underlying factors that contribute to a TED Talk being popular.
+
+## Background
+
+The report uses two datasets. Both were scraped from ted.com by Rounak Banik[^1] and contains data on all the TED Talk videos that were uploaded on the site from 27 June 2006 to 21 September 2017.
+
+The first dataset contains records on each TED Talk, and includes features, such as the amount of views and comments, ratings, video titles, descriptions, and the name of the speakers who appeared in the video. It also includes a list of TED Talks that are related to the video. There are 17 features and 2550 records. The second dataset contains transcripts for each TED Talk, and a list of URLs that link to the transcribed videos. There are 2467 records, which is less than the amount in the first dataset since there are TED Talks that do not have transcripts. Additionally, there are a couple of duplicate entries in the transcripts which reduce the number of entries to 2464. Moreover, the population of this data are viewers from the TED website.
+
+```{r, echo=FALSE}
+head(ted_original)
+```
+
+#1 Preprocess
+
+##1.1 Transforming transcripts
+
+A common method in representing transcripts is by using a term frequency - inverse document frequency (TF-IDF). By removing punctuations, common english stop words and transforming the text to lowercase, a ranking was produced based on how frequent the words occur (term frequency) and how important the words are (document frequency). Then, the top 10 words based on the TF-IDF ranking was selected. Method is based on "Tidy Text Mining with R"[^4].
+
+```{r tf idf, echo=FALSE}
+clean_documents <- c()
+# transforms the transcripts by cleaning all the punctuation
+for(i in 1:dim(ted)[1]) {
+  temp <- unlist(strsplit(gsub("[^[:alnum:] ]", " ", ted$transcript[i]), " +"))
+  clean_documents[i] <- paste(temp, collapse = " ")
+}
+
+# create a document term matrix to clean
+transcriptCorpus <- VCorpus(VectorSource(clean_documents)) 
+transcriptCorpus <- tm_map(transcriptCorpus, stripWhitespace) # clean whitespace of all tokens
+transcriptCorpus <- tm_map(transcriptCorpus, content_transformer(tolower)) # lowercase 
+transcriptCorpus <- tm_map(transcriptCorpus, removeWords, stopwords("english")) # removes stop words from the english dictionary
+transcriptDTM <- DocumentTermMatrix(transcriptCorpus) # get a document term matrix
+
+dtm_transcript <- tidy(transcriptDTM)
+dtm_transcript$document <- as.numeric(dtm_transcript$document)
+total_words <- dtm_transcript %>% group_by(document) %>% summarize(total = sum(count))
+document_words <- left_join(dtm_transcript, total_words)
+
+document_words <- document_words %>%
+  bind_tf_idf(term, document, count)
+head(document_words)
+
+#document_words %>%
+  #group_by(document) %>%
+  #select(-total) %>%
+  #arrange(desc(tf_idf))
+
+# get top 6 words based on the tf_idf criteria
+top_terms_tfidf <- c()
+top_terms_tfidf_count <- c()
+n = 10
+for (i in 1:dim(ted)[1]) {
+   temp <- document_words[which(document_words$document == i),]
+   temp <- temp %>%
+    select(-total) %>%
+    arrange(desc(tf_idf))
+   top_terms_tfidf[[i]] <- temp$term[1:n]
+   top_terms_tfidf_count[[i]] <- temp$count[1:n]
+}
+
+ted$tf_idf <- top_terms_tfidf
+ted$tf_idf_count <- top_terms_tfidf_count
+```
+
+```{r cleaning-ratings, include=FALSE}
+# cleaning ratings (JSON string) 
+ratings_clean = c()
+for (i in 1:dim(ted)[1])
+  {
+    b = fromJSON(str_replace_all(ted$ratings[i],"'",'"'))
+    b$id <- i 
+    ratings_clean <- rbind(b,ratings_clean) # still ungrouped (for later)
+}
+# change OK to Okay because it causes the sentiment analysis to fail
+ratings_clean$name[ratings_clean$name == 'OK'] = 'Okay'
+# get the set of unique ratings
+unique_ratings <- unique(ratings_clean$name)
+# sentiment anlaysis to map words into a numerical value
+sentiment <- analyzeSentiment(tolower(unique_ratings))
+convertToBinaryResponse(sentiment)$SentimentQDAP
+my_sentiments <- as.integer(convertToBinaryResponse(sentiment)$SentimentQDAP == "positive")
+positive = unique_ratings[sentiment <- my_sentiments == 1]
+negative = unique_ratings[sentiment <- my_sentiments == 0]
+
+
+# upon visually inspecting the output we realized there are some misclassification from the sentiment analysis algorithm. Then swap the "funny" and "longwinded"
+
+sentiments_updated <- c(0,1,1,1,1,1,0,0,1,0,1,1,1,1)
+
+positive_updated = unique_ratings[sentiment <- sentiments_updated == 1]
+positive_updated[3] <- "OK"
+negative_updated = unique_ratings[sentiment <- sentiments_updated == 0]
+
+ratings_clean$sentiment <- ratings_clean$name %in% positive_updated
+df <- ratings_clean %>% group_by(id,sentiment) %>% summarise(sentiment_count = sum(count))
+ted$count_positive <- df %>% filter(sentiment == TRUE) %>% pull(sentiment_count)
+ted$count_negative <- df %>% filter(sentiment == FALSE) %>% pull(sentiment_count)
+```
+
+
+```{r film-date, include=FALSE}
+ted$film_date <- NULL
+ted$published_date <- anydate(ted$published_date)
+ted$name <- NULL
+ted$published_date <- as.numeric(format(ted$published_date, format= "%Y"))
+```
+
+```{r clean-titles, include=FALSE}
+# This cleans the titles in the transcript and ted dataframe in order to perform string matching.
+get_related_pairs <- function(ix, df){
+  row <- df[ix, ]
+  self_title <- as.character(row$title)
+  related <- row$related_talks
+  s <- as.character(related)
+  bits <- strsplit(s, ",")
+  rel <- c()
+  for(b in bits[[1]]){
+    #print(b)
+    if(length(grep("'title'", b))>0){
+      b <- strsplit(b, ": ")[[1]]
+      title <- noquote(b[[2]])
+      title <- gsub("'", "", title)
+      title <- gsub("\"", "", title)
+      rel <- c(rel, noquote(title))
+    }
+  }
+  return(data.frame(source=rep(self_title, length(rel)), target=rel))
+}
+ted_original$title2 <- gsub("'", "" ,ted_original$title)
+ted_original$title2 <- gsub("\"", "" ,ted_original$title2)
+
+# each entry in related are the tags from related_talk
+related <- lapply(1:nrow(ted), function(x) get_related_pairs(x, ted))
+
+ted$related_tags = NULL
+ted$related_tags = c()
+# concatenates all the related tags with each observation's tags
+for(i in 1:dim(ted)[1]){
+  related_titles <- unlist(levels(related[[i]][,2]))
+  for(j in 1:length(related_titles)) {
+      tags = ted_original$tags[str_detect(ted_original$title2,fixed(related_titles[j]))]
+      ted[i,]$tags = paste(c(ted[i,]$tags,tags), collapse = ',')
+  }
+}
+
+# cleans the tags to remove all punctuations and splits the cleaned tags into a vector
+csv_tags <-  gsub("\"", "",gsub("'","",gsub("\\]", "",gsub("\\[", "", gsub(", ", ",",ted$tags)))))
+# set of unique tags of ted
+unique_tags <- sort(unique(unlist(strsplit(csv_tags, ","))))
+vector_tags <- strsplit(csv_tags, ",")
+
+# binarizes the events column to 1 if it is an official ted event or 0 otherwise
+ted$is_official = as.integer(grepl("^TED\\d*$|^TEDGlobal+",ted$event))
+```
+
+
+##1.2 Analysis
+
+The amount of views in a video can be seen as an indicator of its popularity. However, it is simply a metric of how many people saw it, and does not inherently represent a positive or negative response.
+
+For example, there exist Youtube videos that have a high amount of views but are also unpopular, such as "Friday", by Rebecca Black.[^2] As of 25 November 2018, it has over 127 million views and 4.5 million like-and-dislike ratings, but it also has a like-to-dislike ratio of 27.8%, which implies the video is severely unpopular. This also shows why ratings and the amount of ratings are more reliable indications of a video's popularity.
+
+Ratings are represented in the data as JSON objects, and a ratings column for a TED Talk is a list of ratings that were given by TED users. Ratings have a "name" key that describes a certain sentiment, such as "Funny" and "Inspiring", or "Longwinded" and "Obnoxious". The first goal is to extract these sentiments and convert them into binary values that represent either "positive" or "negative" sentiments. To find the sentiment of these ratings, the Sentiment Analysis toolbox was used. [^3]
+
+The general objective of sentiment analysis is to find the "sentiment" of a word, or a corpus, of the text. There are many sentiments a word can have, but, for the purposes of this report, the only notable extraction is whether it is positive or negative. There were manual adjustments to some of the classifications that were misclassified by the algorithm. From this, a proportion of negative-to-positive ratings was made for each video.
+By visual inspection it can be seen that the library misclassified "Funny" as negative, and "Longwinded" as positive. Due to such a small ammount of unique ratings it is paramount that all classifications be correct to obtain an accurate result. These two were adjusted to be properly classified as positive for "Funny" and negative for "Longwinded".
+
+In this report, a popular video is defined as having a proportion that is below the median proportion of all the videos in the dataset. If the proportion is equal to or greater than the median, then the video is not popular. Each video was classified using this rule, and the distribution of the proportions was plotted in the following graph. The median was chosen as a measure of centrality because the proportion of negative ratings are not distributed normally.
+
+```{r include=FALSE}
+ted$popularity_porportion = ted$count_negative / (ted$count_negative + ted$count_positive)
+```
+
+```{r include=FALSE}
+ted$log_popularity_porportion = log(ted$popularity_porportion)
+ggplot(ted,aes(x=ted$log_popularity_porportion)) + geom_histogram(bins = 100)
+```
+
+```{r echo=FALSE}
+ggplot(ted,aes(x=ted$popularity_porportion)) + geom_histogram(bins = 100) + geom_vline(aes(xintercept = median(popularity_porportion)),col='red')+xlab("Popularity Rating")+ylab("Number of Videos")
+```
+
+The observations to the left of the red line are popular while the ones to the right are unpopular.
+
+```{r echo=FALSE}
+ggplot(ted,aes(x=languages,y=views))+geom_point()+xlab("Number of Languages")
+```
+
+Upon inspection an upward trend of views as the number of langauges increases can be seen. This is due to the fact that as a video attains more and more views, they then get transcribed in more languages. This is an indication that using languages is not the best measure to figure out if a video is popular because multicollinearity exists. Also, the popularity measure introduced later is to predict popularity on 2017 data. And most videos in 2017 start off with being transcribed in only 1 langauge.
+
+It can be seen that in 2017 videos has a very low amount of languages compared to the other variables. So it can be concluded that languages are correlated with views, and will not be a *fair predictor variable*.
+
+Comments are also correlated with views. It's an unfair predictor, and later further reasoning as to why comments are not used as a predictor. But for a sneak peek, trying to understand what makes a video popular, it's likely that a model will overfit if comments are included as a part of it due to comment uniqueness. And there's nothing special about saying "well if a video has alot of comments then it will probably be popular."
+
+```{r echo=FALSE}
+ggplot(ted,aes(x=comments,y=views)) + geom_point() + geom_smooth(method="lm")
+```
+
+Lastly, transcript.csv was obtained from [^1], these are which transcripts for each video. This is because it is of interest to find the finer themes and words that make videos popular.
+
+Transcripts are included in this report to see if there are any particular words that were said in a TED Talk that make it popular.
+
+[^1]: https://www.kaggle.com/holfyuen/what-makes-a-popular-ted-talk/data?fbclid=IwAR2qDepQybvnlUGmd5TZVJOGXXzhLVS4OiB8tiLW6iAqo0WrFlGmJ_Vjzyg
+
+##1.3 Film date
+
+  When looking at a video, it is important to acknowledge the key considerations when attempting to make a popular video on TED. The hypothetical thought experiment can be seen as the following:
+  
+  Imagine a publisher who has the ability to make a TED Talk. The metrics the publisher can personally control are tags, the transcript, the speaker, and the event type. However, the publisher cannot directly influence user-provided metrics such as views and comments. Therefore, the process excludes variables that is out of the publisher's control, as well as data that is irrelevant to this report, such as URLs. The amount of languages is also discarded since it is linked to the amount of views it has, making it a user-proivded metric. Film date is also discarded because there is no information to infer from it; publish date is the only relevant date to look at.
+ 
+##1.4 Official Ted Events
+
+TED talks are hosted by Events. These events are sometimes hosted by ted themselves, or by independent TED approved groups.So far, there are 85 unique events such as "TED2006" and "Elizabeth G Anderson School".
+
+A new variable,is_official, was preprocessed to indicate whether the talk took place during an official ted event. An official ted event is either TED Global or TED. TEDx and all other are considered independent.
+
+```{r event, include=FALSE}
+ted$is_official = as.integer(grepl("^TED\\d*$|^TEDGlobal+",ted$event))
+```
+
+It is important to note that all the videos below the red line is considered popular. It seems that unofficial events tends to popular more often.
+
+##1.5 Related Talks Tags
+Each observation has a related_talks column, which is a JSON list, indicating the ids and titles of talks similar to the observation. The titles were extracted, and then used to search for their tags, which were appended, to create a related_talk_tag column.
+```{r include=FALSE}
+ted$related_talks[1:1]
+```
+
+#2 Topic Modelling
+
+##2.1 Dimensionality reduction
+There are 12860 features on the preprocessed data. A viable way to visualize the data is by performing Principal Component Analysis (PCA). On figure A, the first two principal components show a clear separation of clusters. However, these two components amount to less than 5% of the entire data. Therefore, performing PCA to reduce the dimensionality isn't a viable choice.
+
+```{r data_split, echo=FALSE, include=FALSE}
+# splits data into each year
+i <- which(ted$published_date == 2006)
+ted2006 <- ted[i,]
+i <- which(ted$published_date == 2007)
+ted2007 <- ted[i,]
+i <- which(ted$published_date == 2008)
+ted2008 <- ted[i,]
+i <- which(ted$published_date == 2009)
+ted2009 <- ted[i,]
+i <- which(ted$published_date == 2009)
+ted2009 <- ted[i,]
+i <- which(ted$published_date == 2010)
+ted2010 <- ted[i,]
+i <- which(ted$published_date == 2011)
+ted2011 <- ted[i,]
+i <- which(ted$published_date == 2012)
+ted2012 <- ted[i,]
+i <- which(ted$published_date == 2013)
+ted2013 <- ted[i,]
+i <- which(ted$published_date == 2014)
+ted2014 <- ted[i,]
+i <- which(ted$published_date == 2015)
+ted2015 <- ted[i,]
+i <- which(ted$published_date == 2016)
+ted2016 <- ted[i,]
+# test data is only from 2017
+i <- which(ted$published_date == 2017)
+ted2017 <- ted[i,]
+# training data ranges from 2006 to 2016
+traindata <- rbind(ted2006,ted2007,ted2008,ted2009, ted2010, ted2011, ted2012,ted2013,ted2014,ted2015,ted2016)
+```
+
+```{r, include=FALSE}
+# popular = 1, not popular = 0, determined by the proportion of negative ratings and is 1 if it's less
+# than the median of proportion of negative ratings and 0 otherwise
+
+# popularity measure based on traindata to get labels
+rt = traindata$count_negative / (traindata$count_positive + traindata$count_negative)
+traindata$ratings_pos = as.integer(rt < median(rt))
+
+rt_2017 = ted2017$count_negative /(ted2017$count_positive + ted2017$count_negative)
+ted2017$ratings_pos = as.integer(rt_2017 < median(rt))
+
+# popularity measure based on ted2016 to get labels
+rt_2016 = ted2016$count_negative / (ted2016$count_positive + ted2016$count_negative)
+ted2016$ratings_pos = as.integer(rt_2016 < median(rt_2016))
+
+
+```
+
+##2.2 Creating bag of tags and words
+The list of tags and related tags on a given video is converted into a bag of tags model, where each column is tied to a tag and each entry in the matrix is tied to the count of words on a given row. Also, the list of words from the TF-IDF rating done previously is then converted into a bag of words model similar to the tags. 
+```{r bag-of-tags, include=FALSE}
+# traindata bag of tags
+data_matrix = matrix(0,nrow = nrow(traindata), ncol = length(unique_tags))
+ind.2 <- which("activism"==unique_tags)
+
+for(i in 1:nrow(traindata)){
+  row = unlist(vector_tags[[i]])
+  for(k in 1:length(row)){
+    ind.2 <- which(row[k]==unique_tags)
+    data_matrix[i,ind.2] = data_matrix[i,ind.2] + 1
+  }
+  
+}
+colnames(data_matrix) <- unique_tags
+
+# ted2016 bag of tags
+csv_tags <-  gsub("\"", "",gsub("'","",gsub("\\]", "",gsub("\\[", "", gsub(", ", ",",ted2016$tags)))))
+vector_tags <- strsplit(csv_tags, ",")
+unique_tags <- sort(unique(unlist(ted2016$tf_idf)))
+
+data_matrix_2016 = matrix(0,nrow = nrow(ted2016), ncol = length(unique_tags))
+for(i in 1:nrow(ted2016)){
+  row = unlist(vector_tags[[i]])
+  for(k in 1:length(row)){
+    ind.2 <- which(row[k]==unique_tags)
+    data_matrix_2016[i,ind.2] = data_matrix_2016[i,ind.2] + 1
+  }
+}
+colnames(data_matrix_2016) <- unique_tags
+
+# ted2017 bag of tags
+csv_tags <- gsub("'","",gsub("\\]", "",gsub("\\[", "", gsub(", ", ",",ted2017$tags))))
+unique_tags <- sort(unique(unlist(strsplit(csv_tags, ","))))
+  
+  rows <- dim(ted2017)[1]
+  df <- data.frame(matrix(0, nrow = dim(ted2017)[1], ncol = length(unique_tags)))
+  colnames(df) <- unique_tags
+  for(i in 1:dim(ted2017)[1]) {
+    curr <- sort(unlist(vector_tags[i]))
+    for(j in 1:length(curr)) {
+      df[i,curr[j] == colnames(df)] =  df[i,curr[j] == colnames(df)] + 1 
+    }
+  }
+```
+
+```{r bag-of-words-from-transcript, include=FALSE}
+# each entry in the matrix is the count of the term given a document (row) and term (column)
+
+# bag of words from transcript for traindata is called df1
+unique_terms <- sort(unique(unlist(traindata$tf_idf))) # get unique terms from the top tf_idf criteria
+df1 <- data.frame(matrix(0, nrow = dim(traindata)[1], ncol = length(unique_terms)))
+colnames(df1) <- unique_terms
+for(i in 1:nrow(traindata)) {
+  curr <- na.omit(unlist(traindata$tf_idf[i]))
+  count <- na.omit(unlist(traindata$tf_idf_count[i]))
+  for(j in 1:length(curr)) {
+
+    df1[i,curr[j] == colnames(df1)] = count[j]
+  }
+}
+# bag of words from transcript for ted2017 is called df2
+unique_terms <- sort(unique(unlist(ted$tf_idf)))
+df2 <- data.frame(matrix(0, nrow = dim(ted2017)[1], ncol = length(unique_terms)))
+colnames(df2) <- unique_terms
+for(i in 1:nrow(ted2017)) {
+  curr <- na.omit(unlist(ted2017$tf_idf[i]))
+  count <- na.omit(unlist(ted2017$tf_idf_count[i]))
+  for(j in 1:length(curr)) {
+
+    df2[i,curr[j] == colnames(df2)] = count[j]
+  }
+}
+#bag of words from transcript for ted2016 is called df3
+unique_terms <- sort(unique(unlist(ted2016$tf_idf)))
+df3 <- data.frame(matrix(0, nrow = dim(ted2016)[1], ncol = length(unique_terms)))
+colnames(df3) <- unique_terms
+for(i in 1:nrow(ted2016)) {
+  curr <- na.omit(unlist(ted2016$tf_idf[i]))
+  count <- na.omit(unlist(ted2016$tf_idf_count[i]))
+  for(j in 1:length(curr)) {
+
+    df3[i,curr[j] == colnames(df3)] = count[j]
+  }
+}
+```
+
+In order to combat the huge dimensions of the data, it is possible to reduce the bag of words and bag of tags into clusters. K-means clustering isn't a good method of unsupervised learning because it uses euclidean distance to cluster into k groups. In the bag of words and tags, each observation is tied to a count of words or tags in each document. Measuring the euclidean distance of words and tags does not make sense because two words may have a short distance but entirely different meaning. One of the proposed models to cluster topics is called Latent Dirichlet Allocation (LDA) which comes from topic modelling and is entirely diffrent from cluster analysis. This method is generative probabilistic model that discover structure from unstructured data. 
+
+LDA clusters a document $i$ into a topic $j \in k$ with a k-dimensional dirichlet distribution that corresponds to the bag words or tags. It computes prior distribution to each words belonging to a topic $j$. After computing a prior probability, it is then possible to derive the posterior distribution given new data. The full derivation of the LDA can be read on http://www.jmlr.org/papers/volume3/blei03a/blei03a.pdf by Blei, Ng and Jordan. 
+
+Some aspects of LDA are driven by intuition, and perplexity is a stastical measure on how well a probability model predicts a sample. For a given k topics the perplexity will measure how well k topics captures the entire data. Based on the perplexity plots below, it was observed that there was a local maxima at k=10 for tags and an inversely proportional relationship. Then by inspecting plot 1 and 2, it shows that 10 topics gives clarity to both tags and trancripts. For example, in plot 3 it shows that topic 1 and 10 are tags related to brains and technology respectively. Also, in plot 4 it shows that topic 5 and 10 are transcripts related to brains and women. This confirms that the separation of topics are viable.
+
+```{r kmeans-pca, echo=FALSE}
+set.seed(69)
+pca_traindata_raw <- cbind(traindata$is_official,data_matrix,df1)
+pca_train2 <- prcomp(pca_traindata_raw,center=TRUE)
+autoplot(pca_train2) + labs(title="Figure A - PCA on the relevant features")
+# On the second plot, the first two principal components cover a very low proportion of the data, however there is a clear separation of clusters. Therefore, PCA isn't a viable choice when reducing dimensionality.
+```
+
+```{r perplexity-tags-traindata, echo=FALSE}
+# reference: https://cfss.uchicago.edu/fall2016/text02.html#objectives
+n_topics <- c(2,4,6,8,10,12,14)
+tag_lda_compare <- n_topics %>%
+  map(LDA, x = data_matrix, control = list(seed = 69))
+
+data_frame(k = n_topics,
+           perplex = map_dbl(tag_lda_compare, perplexity)) %>%
+  ggplot(aes(k, perplex)) +
+  geom_point() +
+  geom_line() +
+  labs(title = "Evaluating LDA topic models for tags",
+       subtitle = "Optimal number of topics",
+       x = "Number of topics",
+       y = "Perplexity")
+# Plot shows a local maximum with k=10
+```
+
+```{r perplexity-transcript, echo=FALSE}
+# reference: https://cfss.uchicago.edu/fall2016/text02.html#objectives
+n_topics <- c(2,3,4,5,6,8,10,11,12,13)
+trans_lda_compmare <- n_topics %>%
+  map(LDA, x = df1, control = list(seed = 69))
+
+data_frame(k = n_topics,
+           perplex = map_dbl(trans_lda_compmare, perplexity)) %>%
+  ggplot(aes(k, perplex)) +
+  geom_point() +
+  geom_line() +
+  labs(title = "Evaluating LDA topic models for transcript",
+       subtitle = "Optimal number of topics",
+       x = "Number of topics",
+       y = "Perplexity")
+# Plot shows an inversely proportional relationship between perplexity and k (number of topics)
+```
+
+```{r tags-lda-traindata, echo=FALSE}
+# k = 10 based on perplexity
+my_lda <- LDA(data_matrix, k = 10, control = list(seed = 69)) #change k here to control howmany groups
+
+muh_topics <- tidy(my_lda, matrix = "beta")
+
+top_terms <- muh_topics %>%
+  group_by(topic) %>%
+  top_n(6, beta) %>% # change this top_n if you want to control how many top words to appear
+  ungroup() %>%
+  arrange(topic, -beta)
+
+top_terms %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free_y") +
+  coord_flip() + labs(title = "Plot 1 - LDA on Tags")
+```
+
+```{r transcript-lda-traindata, echo=FALSE}
+  # k = 10 because it is same number of topics as tags
+  transcript_lda <- LDA(df1, k = 10, control = list(seed = 69))
+  muh_topics <- tidy(transcript_lda, matrix = "beta")
+
+  top_terms <- muh_topics %>%
+  group_by(topic) %>%
+  top_n(8, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+  top_terms %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free_y") + coord_flip() + labs(title = "Plot 2 - LDA on Tags")
+  
+```
+
+
+```{r transcript groups, include=FALSE}
+transcript_groups <- tidy(transcript_lda, matrix = "gamma")
+tag_groups <- tidy(my_lda, matrix ="gamma")
+# label tags
+tag1 <- tag_groups$gamma[which(tag_groups$topic == 1)]
+tag2 <- tag_groups$gamma[which(tag_groups$topic == 2)]
+tag3 <- tag_groups$gamma[which(tag_groups$topic == 3)]
+tag4 <- tag_groups$gamma[which(tag_groups$topic == 4)]
+tag5 <- tag_groups$gamma[which(tag_groups$topic == 5)]
+tag6 <- tag_groups$gamma[which(tag_groups$topic == 6)]
+tag7 <- tag_groups$gamma[which(tag_groups$topic == 7)]
+tag8 <- tag_groups$gamma[which(tag_groups$topic == 8)]
+tag9 <- tag_groups$gamma[which(tag_groups$topic == 9)]
+tag10 <- tag_groups$gamma[which(tag_groups$topic == 10)]
+
+transcript_g1 <- transcript_groups$gamma[which(transcript_groups$topic == 1)]
+transcript_g2 <- transcript_groups$gamma[which(transcript_groups$topic == 2)]
+transcript_g3 <- transcript_groups$gamma[which(transcript_groups$topic == 3)]
+transcript_g4 <- transcript_groups$gamma[which(transcript_groups$topic == 4)]
+transcript_g5 <- transcript_groups$gamma[which(transcript_groups$topic == 5)]
+transcript_g6 <- transcript_groups$gamma[which(transcript_groups$topic == 6)]
+transcript_g7 <- transcript_groups$gamma[which(transcript_groups$topic == 7)]
+transcript_g8 <- transcript_groups$gamma[which(transcript_groups$topic == 8)]
+transcript_g9 <- transcript_groups$gamma[which(transcript_groups$topic == 9)]
+transcript_g10 <- transcript_groups$gamma[which(transcript_groups$topic == 10)]
+
+tag_topic_proba <- cbind(tag1,tag2,tag3,tag4,tag5)
+trans_topic_proba <- cbind(transcript_g1,transcript_g1,transcript_g2,transcript_g3,transcript_g4,transcript_g5,transcript_g6,transcript_g8,transcript_g8)
+
+tag_topic <-max.col(tag_topic_proba)
+trans_topic <- max.col(trans_topic_proba)
+# equivalent to: topics(my_lda)
+traindata$tag_topic <-max.col(tag_topic_proba)
+# equivalent to: topics(transcript_lda)
+traindata$trans_topic <- max.col(trans_topic_proba)
+
+  #posterior probability for newdata from traindata for tags
+  ted_train_2017_posterior_tags <- posterior(my_lda, df)
+  ted2017$tag_topic <- max.col(ted_train_2017_posterior_tags$topics,'first')
+  #posterior probability for newdata from traindata for transcript
+ted_train_2017_posterior_trans <-  posterior(transcript_lda, df2)
+ted2017$trans_topic <- max.col(ted_train_2017_posterior_trans$topics,'first')
+```
+
+Running LDA on the data for 2016 also gives a good separation of topics. Choosing the same number of topics as the training data will give consistency. In plot1, topic 1 and 4 are tags related to governments and health respectively. In plot2, topic 4 and 6 are transcripts related to brain cancer and water in planets respectively.
+
+```{r ted2016-tf-idf, include=FALSE}
+# used for ted2016 LDA for transcripts
+clean_documents <- c()
+for(i in 1:dim(ted2016)[1]) {
+  temp <- unlist(strsplit(gsub("[^[:alnum:] ]", " ", ted$transcript[i]), " +"))
+  clean_documents[i] <- paste(temp, collapse = " ")
+}
+transcriptCorpus <- VCorpus(VectorSource(clean_documents)) 
+transcriptCorpus <- tm_map(transcriptCorpus, stripWhitespace)
+transcriptCorpus <- tm_map(transcriptCorpus, content_transformer(tolower))
+transcriptCorpus <- tm_map(transcriptCorpus, removeWords, stopwords("english"))
+transcriptDTM <- DocumentTermMatrix(transcriptCorpus)
+dtm_transcript <- tidy(transcriptDTM)
+dtm_transcript$document <- as.numeric(dtm_transcript$document)
+total_words <- dtm_transcript %>% group_by(document) %>% summarize(total = sum(count))
+document_words <- left_join(dtm_transcript, total_words)
+document_words <- document_words %>%
+  bind_tf_idf(term, document, count)
+document_words
+
+document_words %>%
+  group_by(document) %>%
+  select(-total) %>%
+  arrange(desc(tf_idf))
+
+top_terms_tfidf <- c()
+top_terms_tfidf_count <- c()
+n = 10
+for (i in 1:dim(ted2016)[1]) {
+   temp <- document_words[which(document_words$document == i),]
+   temp <- temp %>%
+    select(-total) %>%
+    arrange(desc(tf_idf))
+   top_terms_tfidf[[i]] <- temp$term[1:n]
+   top_terms_tfidf_count[[i]] <- temp$count[1:n]
+}
+ted2016$tf_idf <- top_terms_tfidf
+ted2016$tf_idf_count <- top_terms_tfidf_count
+```
+
+```{r ted2016-lda-tags, include=FALSE}
+my_lda <- LDA(data_matrix_2016, k = 10, control = list(seed = 69)) #change k here to control how many groups
+
+muh_topics <- tidy(my_lda, matrix = "beta")
+
+top_terms <- muh_topics %>%
+  group_by(topic) %>%
+  top_n(6, beta) %>% # change this top_n if you want to control how many top words to appear
+  ungroup() %>%
+  arrange(topic, -beta)
+```
+
+```{r, echo=FALSE}
+top_terms %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free_y") +
+  coord_flip()
+
+ted2016$tag_topic <- topics(my_lda)
+ted_2016_2017_posterior_tags <- posterior(my_lda, df)
+ted2017$tag_topic <- max.col(ted_2016_2017_posterior_tags$topics,'first')
+```
+
+```{r ted2016-lda-transcript, include=FALSE}
+  # k = 10 because it is same number of topics as tags
+  transcript_lda <- LDA(df3, k = 10, control = list(seed = 69))
+  muh_topics <- tidy(transcript_lda, matrix = "beta")
+  muh_topics
+
+  top_terms <- muh_topics %>%
+  group_by(topic) %>%
+  top_n(8, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+```
+
+```{r, echo=FALSE}
+  top_terms %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free_y") +
+  coord_flip()
+  
+  ted2016$trans_topic <- topics(transcript_lda)
+ted_2016_2017_posterior_trans <-  posterior(transcript_lda, df2)
+ted2017$trans_topic <- max.col(ted_2016_2017_posterior_trans$topics,'first')
+```
+
+#3 Classifier
+
+
+##3.1 Logistic Regression
+After grouping the tags and transcripts into respective topics, it is now possible to build a model. Both the transcripts and the TED Talk topic features range from 0 to 10, and the popular/unpopular and official/unofficial TED Talk features are binary. The model to predict the popularity of the talks is logistic regression. We are not using an accuracy score because it has an imbalanced dataset, making it a bad metric. For example, TED 2017 might have more positive ratings, making it an imbalanced dataset. Data is not normal, so we don't take into account the expected cost of misclassification. There are many approaches to loss functions, but the chosen loss function for this model is 0-1 loss because it is the easiest to optimize. The logistic regression model has a log loss, but it approximates to a 0-1 loss.  By Occam's razor, we use the simpler one. The training set for the model is the TED Talk data up to 2016, and the test set is the data from 2017. The labels for both sets are the popular measures that were defined earlier in the report. The goal for this model is to measure whether or not the historical TED data was a good predictor for future data. The model was fitted on the training data and was tested on the testing data.  
+```{r classifier, echo=FALSE}
+# zero one loss is better than using the score of accuracy
+# traindata
+rt = traindata$count_negative / (traindata$count_positive + traindata$count_negative)
+traindata$ratings_pos = as.integer(rt < median(rt))
+
+rt_2017 = ted2017$count_negative /(ted2017$count_positive + ted2017$count_negative)
+ted2017$ratings_pos = as.integer(rt_2017 < median(rt))
+  
+  my_glm1 <- glm(ratings_pos ~ trans_topic + tag_topic + is_official, family="binomial", data=traindata)
+  summary(my_glm1)
+  test_accuracy1 <- predict(my_glm1,ted2017)
+  predict_labels1 <- test_accuracy1 > 0
+  ZeroOneLoss(predict_labels1, ted2017$ratings_pos)
+```
+  
+Another model was trained only on the TED data from 2016. The goal for this model is to see if the immediate past data is a good predictor for future data. 
+
+  
+```{r, echo=FALSE}
+#  ted2016 
+# 2016 alone with the samme amount tag and transcript topics, 
+  rt_2017 = ted2017$count_negative /(ted2017$count_positive + ted2017$count_negative)
+  ted2017$ratings_pos = as.integer(rt_2017 < median(rt_2016))
+  
+  my_glm <- glm(ratings_pos ~ trans_topic + tag_topic + is_official, family="binomial", data=ted2016)
+    summary(my_glm)
+  test_accuracy <- predict(my_glm,ted2017)
+  predict_labels <- test_accuracy > 0
+  ZeroOneLoss(predict_labels, ted2017$ratings_pos)
+```
+
+For this run, both models achieved an accuracy just above 54.87%, meaning it was only slightly better than flipping a fair coin. Therefore, there is no definitive conclusion as to whether or not historical and immediate past data are good predictors for future data. Finally, the likelihood ratio test gave 23.5, which is greater than our chi-squared critical value (alpha = 0.05,df = 3), which is 7.814. Therefore, the null hypthesis is rejected and it is concluded that the model has significant features.
+
+#4 Closing
+
+##4.1 Next Steps
+
+Logistic regression may not be the best predictor for predicting TED Talk data. So, one would look at other models that would produce better accuracies. Stratified k-fold cross-validating would be a good method to determine whether or not the model is overfitting. The LDA model would also be changed from a 1-gram model to a k-gram model. The transcript would also be cleaned to take out words that can be characterized as stopwords, such as "yeah". Other numerical popularity measures that are correlated to views could be considered.
+
+##4.2 Conclusion
+Based on our findings, the tags, transcripts and type of event associated with the video are good starting points to determine popularity.
+
+[^1]: Rounak Banik, "TED Talks," Kaggle, September 25, 2017, accessed November 25, 2018, https://www.kaggle.com/rounakbanik/ted-talks.
+
+[^2]: Rebecca Black, "Rebecca Black - Friday," YouTube, September 16, 2011, accessed November 25, 2018, https://www.youtube.com/watch?v=kfVsfOSbJY0.
+
+[^3]: Stefan Feuerriegel and Nicolas Proellochs, The Comprehensive R Archive Network, April 09, 2018, accessed November 25, 2018, https://cran.r-project.org/web/packages/SentimentAnalysis/vignettes/SentimentAnalysis.html#applications-in-research.
+
+[^4]: Julia Silge & David Robinson, "Tidy Text Mining With R", Website, accessed November 25,2018, https://www.tidytextmining.com/
